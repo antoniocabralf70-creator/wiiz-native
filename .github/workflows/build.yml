@@ -1,0 +1,353 @@
+name: Build WiiXNative APK
+
+on:
+  workflow_dispatch:
+    inputs:
+      abi:
+        description: 'ABI do núcleo nativo'
+        type: choice
+        default: arm64-v8a
+        options: [arm64-v8a, armeabi-v7a, x86_64]
+      variant:
+        description: 'Tipo de build (debug = padrão seguro, release = otimizado)'
+        type: choice
+        default: debug
+        options: [debug, release]
+  push:
+    branches: [main, master]
+    paths-ignore: ['**.md', 'docs/**']
+  pull_request:
+    paths-ignore: ['**.md', 'docs/**']
+
+# Cancela builds antigos da mesma branch
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  NDK_VERSION: '26.1.10909125'
+  CMAKE_VERSION: '3.22.1'
+  ANDROID_PLATFORM: 'android-26'
+  # Pasta (relativa à raiz do projeto Android) com o CMakeLists.txt do núcleo
+  CORE_DIR: core
+  # LTO (thin) deixa o núcleo mais rápido, mas pode falhar no link. Ligue ('true') depois que o build básico funcionar
+  ENABLE_LTO: 'false'
+  ABI: ${{ inputs.abi || 'arm64-v8a' }}
+  VARIANT: ${{ inputs.variant || 'debug' }}
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build:
+    name: Núcleo + APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Instalar pacotes do SDK/NDK
+        run: |
+          set -euo pipefail
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager \
+            "platform-tools" \
+            "platforms;android-34" \
+            "build-tools;34.0.0" \
+            "ndk;${NDK_VERSION}" \
+            "cmake;${CMAKE_VERSION}"
+          echo "ANDROID_NDK_HOME=${ANDROID_HOME}/ndk/${NDK_VERSION}" >> "$GITHUB_ENV"
+
+      - name: Ferramentas de build nativo
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ninja-build ccache
+          {
+            echo "CCACHE_DIR=$HOME/.cache/ccache"
+            echo "CCACHE_BASEDIR=$GITHUB_WORKSPACE"
+            echo "CCACHE_NOHASHDIR=true"
+            echo "CCACHE_COMPILERCHECK=content"
+            echo "CCACHE_SLOPPINESS=pch_defines,time_macros"
+            echo "CCACHE_MAXSIZE=1G"
+          } >> "$GITHUB_ENV"
+
+      - name: Cache do ccache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ccache
+          key: ccache-${{ env.ABI }}-${{ env.ENABLE_LTO }}-${{ github.sha }}
+          restore-keys: |
+            ccache-${{ env.ABI }}-${{ env.ENABLE_LTO }}-
+            ccache-${{ env.ABI }}-
+
+      - name: Localizar projeto Android
+        id: project
+        run: |
+          set -euo pipefail
+          mkdir -p source
+          ZIP_FILE="$(find . -maxdepth 1 -type f -iname 'WiiXNative-Android-GitHub.zip' -print -quit)"
+          if [ -n "$ZIP_FILE" ]; then
+            unzip -q -o "$ZIP_FILE" -d source
+          fi
+
+          # Pega o settings.gradle mais próximo da raiz
+          SETTINGS_FILE="$(find . -type f \( -name settings.gradle -o -name settings.gradle.kts \) \
+            -not -path './.git/*' -not -path '*/.gradle/*' -not -path '*/build/*' \
+            | awk '{ print length, $0 }' | sort -n | head -1 | cut -d' ' -f2-)"
+          if [ -z "$SETTINGS_FILE" ]; then
+            echo '::error::Não encontrei settings.gradle(.kts).'
+            find . -maxdepth 5 -type f -not -path './.git/*' | sort | head -200
+            exit 1
+          fi
+
+          PROJECT_DIR="$(dirname "$SETTINGS_FILE")"
+          [ -f "$PROJECT_DIR/app/build.gradle" ] || [ -f "$PROJECT_DIR/app/build.gradle.kts" ] || {
+            echo "::error::Não encontrei app/build.gradle(.kts) em $PROJECT_DIR."; exit 1; }
+          [ -f "$PROJECT_DIR/app/src/main/AndroidManifest.xml" ] || {
+            echo "::error::Não encontrei AndroidManifest.xml em $PROJECT_DIR."; exit 1; }
+
+          echo "dir=$PROJECT_DIR" >> "$GITHUB_OUTPUT"
+          echo "Projeto Android localizado em: $PROJECT_DIR"
+
+      # ---------------------------------------------------------------
+      # NÚCLEO (core) nativo em C++ -> libs .so dentro de jniLibs/<abi>
+      # Compilado com -O3 + LTO, depois "strip". A versão com símbolos
+      # (para ndk-stack / addr2line) vai num artefato separado.
+      # ---------------------------------------------------------------
+      - name: Compilar núcleo nativo
+        id: core
+        env:
+          PROJECT_DIR: ${{ steps.project.outputs.dir }}
+        run: |
+          set -euo pipefail
+          CORE_PATH="$PROJECT_DIR/$CORE_DIR"
+          if [ ! -f "$CORE_PATH/CMakeLists.txt" ]; then
+            MSG="Núcleo não encontrado em $CORE_PATH/CMakeLists.txt — o APK NÃO terá o núcleo nativo (jogos não vão iniciar se o app depender dele)."
+            echo "::warning::$MSG"
+            echo "### ⚠️ $MSG" >> "$GITHUB_STEP_SUMMARY"
+            echo "built=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          export PATH="${ANDROID_HOME}/cmake/${CMAKE_VERSION}/bin:$PATH"
+          LLVM="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64"
+
+          # Ajustes por arquitetura
+          EXTRA=()
+          ARCH_FLAGS=""
+          case "$ABI" in
+            arm64-v8a)   TRIPLE=aarch64-linux-android ;;
+            armeabi-v7a) TRIPLE=arm-linux-androideabi
+                         EXTRA=(-DANDROID_ARM_NEON=ON -DANDROID_ARM_MODE=arm) ;;
+            x86_64)      TRIPLE=x86_64-linux-android
+                         ARCH_FLAGS="-msse4.2 -mpopcnt" ;;
+            *) echo "::error::ABI desconhecida: $ABI"; exit 1 ;;
+          esac
+
+          OPT="-O3 -g -DNDEBUG -ffunction-sections -fdata-sections $ARCH_FLAGS"
+          LDOPT="-Wl,--gc-sections -Wl,-z,max-page-size=16384"
+          if [ "$ENABLE_LTO" = "true" ]; then
+            OPT="$OPT -flto=thin"
+            LDOPT="$LDOPT -flto=thin"
+          fi
+
+          OUT="$PWD/core-out/$ABI"
+          SYM="$PWD/core-symbols/$ABI"
+          mkdir -p "$OUT" "$SYM"
+
+          ccache -z
+          build_core() {
+            rm -rf "core-build/$ABI"
+            cmake -S "$CORE_PATH" -B "core-build/$ABI" -G Ninja \
+              -DCMAKE_TOOLCHAIN_FILE="$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake" \
+              -DANDROID_ABI="$ABI" \
+              -DANDROID_PLATFORM="$ANDROID_PLATFORM" \
+              -DANDROID_STL=c++_shared \
+              -DCMAKE_BUILD_TYPE=Release \
+              -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+              -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+              -DCMAKE_LIBRARY_OUTPUT_DIRECTORY="$OUT" \
+              "$@" &&
+            cmake --build "core-build/$ABI" --parallel "$(nproc)"
+          }
+
+          # 1ª tentativa: flags otimizadas. Se falhar, refaz com os padrões do CMake
+          # (o mesmo que o workflow original fazia) para o APK sempre sair.
+          if ! build_core \
+              -DCMAKE_C_FLAGS_RELEASE="$OPT" \
+              -DCMAKE_CXX_FLAGS_RELEASE="$OPT" \
+              -DCMAKE_SHARED_LINKER_FLAGS_RELEASE="$LDOPT" \
+              -DCMAKE_MODULE_LINKER_FLAGS_RELEASE="$LDOPT" \
+              "${EXTRA[@]}"; then
+            echo "::warning::Build otimizado do núcleo falhou; refazendo com flags padrão."
+            echo "### ⚠️ Build otimizado do núcleo falhou; usei flags padrão" >> "$GITHUB_STEP_SUMMARY"
+            build_core "${EXTRA[@]}"
+          fi
+          ccache -s || true
+
+          # Se o CMake do núcleo ignorou o diretório de saída, procura as .so geradas
+          if ! ls "$OUT"/*.so >/dev/null 2>&1; then
+            find "core-build/$ABI" -name '*.so' -not -path '*/CMakeFiles/*' -exec cp {} "$OUT/" \;
+          fi
+
+          # STL compartilhada precisa ir junto com o núcleo
+          STL_LIB="$LLVM/sysroot/usr/lib/$TRIPLE/libc++_shared.so"
+          if [ -f "$STL_LIB" ]; then cp "$STL_LIB" "$OUT/"; else
+            echo "::warning::libc++_shared.so não encontrada em $STL_LIB"; fi
+
+          if ! ls "$OUT"/*.so >/dev/null 2>&1; then
+            echo "::error::O núcleo compilou, mas nenhuma .so foi gerada em $OUT."
+            exit 1
+          fi
+
+          # Guarda cópia com símbolos e tira os símbolos das que vão no APK
+          cp "$OUT"/*.so "$SYM/"
+          "$LLVM/bin/llvm-strip" --strip-unneeded "$OUT"/*.so || echo "::warning::strip falhou; usando .so sem strip"
+
+          JNI_DIR="$PROJECT_DIR/app/src/main/jniLibs/$ABI"
+          mkdir -p "$JNI_DIR"
+          cp "$OUT"/*.so "$JNI_DIR/"
+          set +e  # diagnóstico abaixo nunca deve derrubar o build
+
+          # Diagnóstico: dependências (NEEDED) que não estão no APK nem no sistema
+          SYS='libc.so|libm.so|libdl.so|liblog.so|libandroid.so|libEGL.so|libGLESv1_CM.so|libGLESv2.so|libGLESv3.so|libvulkan.so|libz.so|libOpenSLES.so|libaaudio.so|libmediandk.so|libnativewindow.so|libjnigraphics.so|libcamera2ndk.so|libamidi.so'
+          for so in "$JNI_DIR"/*.so; do
+            while read -r dep; do
+              [ -z "$dep" ] && continue
+              [ -f "$JNI_DIR/$dep" ] && continue
+              echo "$dep" | grep -qE "^($SYS)$" && continue
+              echo "::warning::$(basename "$so") depende de '$dep', que não vai no APK (UnsatisfiedLinkError em runtime)."
+            done < <("$LLVM/bin/llvm-readelf" -d "$so" | sed -n 's/.*Shared library: \[\(.*\)\]/\1/p')
+          done
+
+          set -e
+          echo "built=true" >> "$GITHUB_OUTPUT"
+          {
+            echo "### Núcleo ($ABI, -O3, LTO=$ENABLE_LTO)"
+            echo '```'
+            ls -lh "$OUT"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload do núcleo (.so)
+        if: steps.core.outputs.built == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: WiiXNative-core-${{ env.ABI }}
+          path: core-out/${{ env.ABI }}/*.so
+          retention-days: 14
+
+      - name: Upload dos símbolos de depuração
+        if: steps.core.outputs.built == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: WiiXNative-core-symbols-${{ env.ABI }}
+          path: core-symbols/${{ env.ABI }}/*.so
+          retention-days: 14
+
+      # ---------------------------------------------------------------
+      # APK
+      # ---------------------------------------------------------------
+      - name: Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+          cache-read-only: ${{ github.ref != 'refs/heads/main' && github.ref != 'refs/heads/master' }}
+
+      - name: Compilar APK
+        env:
+          PROJECT_DIR: ${{ steps.project.outputs.dir }}
+        run: |
+          set -o pipefail
+          if [ -x "$PROJECT_DIR/gradlew" ]; then GRADLE="$PROJECT_DIR/gradlew"; else GRADLE="gradle"; fi
+          run_gradle() {
+            "$GRADLE" --no-daemon --stacktrace --warning-mode=summary \
+              -p "$PROJECT_DIR" ":app:assemble$1" 2>&1 | tee -a build.log
+          }
+          if ! run_gradle "${VARIANT^}"; then
+            if [ "$VARIANT" = "release" ]; then
+              echo "::warning::Build release falhou; gerando debug no lugar (veja build.log)."
+              echo "VARIANT=debug" >> "$GITHUB_ENV"
+              run_gradle Debug
+            else
+              exit 1
+            fi
+          fi
+
+      # Release sai "unsigned": alinha (zipalign) e assina para poder instalar.
+      - name: Alinhar e assinar APK
+        env:
+          PROJECT_DIR: ${{ steps.project.outputs.dir }}
+        run: |
+          set -euo pipefail
+          BT="$ANDROID_HOME/build-tools/34.0.0"
+          SRC="$(find "$PROJECT_DIR/app/build/outputs/apk/$VARIANT" -name '*.apk' -print -quit)"
+          [ -n "$SRC" ] || { echo "::error::Nenhum APK $VARIANT gerado."; exit 1; }
+          mkdir -p dist
+          DEST="dist/WiiXNative-$ABI-$VARIANT.apk"
+
+          if [[ "$SRC" == *unsigned* ]]; then
+            KS="$RUNNER_TEMP/ci.jks"
+            keytool -genkeypair -keystore "$KS" -storepass android -keypass android \
+              -alias ci -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=WiiXNative CI"
+            "$BT/zipalign" -p -f 4 "$SRC" "$DEST"
+            "$BT/apksigner" sign --ks "$KS" --ks-pass pass:android --key-pass pass:android "$DEST"
+          else
+            cp "$SRC" "$DEST"
+          fi
+          "$BT/apksigner" verify "$DEST"
+          echo "APK final: $DEST"
+
+      - name: Verificar conteúdo do APK
+        run: |
+          set -euo pipefail
+          APK="$(find dist -name '*.apk' -print -quit)"
+          {
+            echo "### APK ($VARIANT)"
+            echo "Tamanho: $(du -h "$APK" | cut -f1)"
+            echo '```'
+            unzip -l "$APK" | grep -E 'lib/.*\.so' || echo "(sem bibliotecas nativas)"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "${{ steps.core.outputs.built }}" = "true" ]; then
+            unzip -l "$APK" | grep -q "lib/$ABI/" || {
+              echo "::error::O núcleo foi compilado, mas não entrou no APK (lib/$ABI/ ausente). Confira abiFilters/jniLibs no build.gradle."
+              exit 1; }
+          fi
+
+      - name: Upload do log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: WiiXNative-build-log
+          path: build.log
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Upload do APK
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: WiiXNative-Android-${{ env.VARIANT }}
+          path: dist/*.apk
+          if-no-files-found: error
+          retention-days: 14
