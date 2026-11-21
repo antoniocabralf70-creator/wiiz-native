@@ -1,34 +1,30 @@
-name: WiiXNative Build (núcleo Fractal)
+name: WiiXNative Build (Cemu Android otimizado)
 
-# Compila o Fractal (https://github.com/dfdx047/Fractal), emulador de Wii U para Android
-# derivado do Cemu. Licença MPL-2.0 (geração de quadros em GPL-3.0): mantenha os créditos
-# e a licença ao redistribuir o APK.
+# Compila o app completo do Cemu Android com otimizações fortes para ARM64/MediaTek
+# e assina o APK com uma chave de teste para poder instalar no aparelho.
 
 on:
   workflow_dispatch:
     inputs:
-      fractal_ref:
-        description: "Branch, tag ou commit do Fractal"
+      cemu_repo:
+        description: "Repositório do Cemu Android"
         type: string
-        default: main
-      gradle_task:
-        description: "Tarefa do Gradle"
-        type: choice
-        default: assembleRelease
-        options:
-          - assembleRelease
-          - assembleDebug
-      inject_flags:
-        description: "Injetar flags -O3/LTO próprias (o Fractal já vem ajustado; deixe desligado)"
-        type: boolean
-        default: false
+        default: "https://github.com/Producdevity/Cemu-Android.git"
+      cemu_ref:
+        description: "Branch, tag ou commit"
+        type: string
+        default: ""
       cpu_profile:
-        description: "Perfil de CPU, só se inject_flags estiver ligado"
+        description: "Perfil de CPU"
         type: choice
         default: armv82
         options:
-          - armv82
-          - armv8
+          - armv82   # Cortex-A75/A76/A78 (Helio G90+, Dimensity)
+          - armv8    # seguro p/ CPUs antigas (Cortex-A53/A55)
+      fast_math:
+        description: "Usar -ffast-math (mais rápido, pode quebrar o float do PPC)"
+        type: boolean
+        default: false
   push:
     branches: [main, master]
 
@@ -39,14 +35,11 @@ concurrency:
 permissions:
   contents: read
 
-env:
-  FRACTAL_REPO: "https://github.com/dfdx047/Fractal.git"
-
 jobs:
-  build-fractal:
-    name: Compilar Fractal (arm64-v8a)
+  build:
+    name: Compilar Cemu Android (arm64-v8a, otimizado)
     runs-on: ubuntu-latest
-    timeout-minutes: 300
+    timeout-minutes: 330
 
     steps:
       - name: Liberar espaço em disco
@@ -60,12 +53,13 @@ jobs:
           distribution: temurin
           java-version: "17"
 
-      - name: Ferramentas de build
+      - name: Dependências de build (vcpkg/CMake)
         shell: bash
         run: |
           set -eo pipefail
           sudo apt-get update -qq
-          sudo apt-get install -y -qq ninja-build ccache pkg-config zip unzip curl git
+          sudo apt-get install -y -qq ninja-build ccache pkg-config nasm autoconf automake libtool \
+            autoconf-archive bison flex python3 zip unzip curl git linux-libc-dev
           { yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses >/dev/null; } || true
 
       - uses: actions/cache@v4
@@ -75,62 +69,90 @@ jobs:
             ~/.gradle/caches
             ~/.gradle/wrapper
             ~/.cache/vcpkg
-          key: fractal-${{ runner.os }}-${{ github.run_id }}
-          restore-keys: fractal-${{ runner.os }}-
+          key: cemu-${{ runner.os }}-${{ github.run_id }}
+          restore-keys: cemu-${{ runner.os }}-
 
-      - name: Baixar o Fractal (com submódulos)
+      - name: Baixar o Cemu Android (com submódulos)
         shell: bash
         run: |
           set -eo pipefail
           mkdir -p logs
-          git clone "$FRACTAL_REPO" fractal
-          cd fractal
-          git checkout "${{ github.event.inputs.fractal_ref || 'main' }}"
-          git submodule update --init --recursive --depth 1 || git submodule update --init --recursive
+          git clone "${{ github.event.inputs.cemu_repo || 'https://github.com/Producdevity/Cemu-Android.git' }}" cemu
+          cd cemu
+          REF="${{ github.event.inputs.cemu_ref }}"
+          [ -n "$REF" ] && git checkout "$REF"
+          git submodule update --init --recursive
           echo "commit: $(git rev-parse HEAD)"
+          ls -la
+          ls BUILD* 2>/dev/null || true
 
       - name: Localizar o projeto Gradle
         id: proj
         shell: bash
         run: |
           set -eo pipefail
-          cd fractal
-          echo "=== BUILD / docs ==="
-          ls -la; ls BUILD* docs 2>/dev/null | head -30 || true
+          cd cemu
           GW=$(find . -maxdepth 4 -name gradlew -not -path "*/dependencies/*" -not -path "*/externals/*" | head -1)
-          if [ -z "$GW" ]; then echo "gradlew não encontrado"; find . -maxdepth 3 -name "build.gradle*" | head; exit 1; fi
-          DIR=$(dirname "$GW")
-          echo "Projeto Gradle em: $DIR"
-          echo "dir=$DIR" >> "$GITHUB_OUTPUT"
+          [ -n "$GW" ] || { echo "gradlew não encontrado"; exit 1; }
+          echo "dir=$(dirname "$GW")" >> "$GITHUB_OUTPUT"
+          echo "Projeto Gradle em: $(dirname "$GW")"
 
-      - name: Flags opcionais (-O3, LTO, perfil MediaTek)
-        if: ${{ github.event.inputs.inject_flags == 'true' }}
+      - name: Definir flags de otimização máxima
         shell: bash
         run: |
           set -eo pipefail
-          if [ "${{ github.event.inputs.cpu_profile }}" = "armv8" ]; then
+          if [ "${{ github.event.inputs.cpu_profile || 'armv82' }}" = "armv8" ]; then
             ARCH="-march=armv8-a+crc+crypto -mtune=cortex-a55"
           else
             ARCH="-march=armv8.2-a+dotprod+fp16+crypto -mtune=cortex-a76"
           fi
-          C="-O3 $ARCH -DNDEBUG -fomit-frame-pointer -fvisibility=hidden -ffunction-sections -fdata-sections -flto=thin"
+          C="-O3 $ARCH -DNDEBUG -fomit-frame-pointer -fno-semantic-interposition"
+          C="$C -fvisibility=hidden -ffunction-sections -fdata-sections -flto=thin"
+          [ "${{ github.event.inputs.fast_math }}" = "true" ] && C="$C -ffast-math"
           L="-flto=thin -Wl,--gc-sections -Wl,-O2 -Wl,--icf=all"
-          echo "CFLAGS=$C" >> "$GITHUB_ENV"; echo "CXXFLAGS=$C" >> "$GITHUB_ENV"; echo "LDFLAGS=$L" >> "$GITHUB_ENV"
+          {
+            echo "CFLAGS=$C"; echo "CXXFLAGS=$C"; echo "LDFLAGS=$L"
+            echo "OPT_C=$C";  echo "OPT_L=$L"
+          } >> "$GITHUB_ENV"
           echo "Flags: $C"
 
-      - name: Compilar
+      - name: Injetar flags no Gradle (init script)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > "$HOME/opt-init.gradle" << INITGRADLE
+          allprojects {
+            plugins.withId('com.android.application') { configureOpt(it) }
+            plugins.withId('com.android.library') { configureOpt(it) }
+          }
+          def configureOpt(p) {
+            project.android.defaultConfig {
+              ndk { abiFilters 'arm64-v8a' }
+              externalNativeBuild {
+                cmake {
+                  cFlags "$OPT_C"
+                  cppFlags "$OPT_C"
+                  arguments "-DCMAKE_BUILD_TYPE=Release",
+                            "-DCMAKE_SHARED_LINKER_FLAGS=$OPT_L",
+                            "-DCMAKE_EXE_LINKER_FLAGS=$OPT_L"
+                }
+              }
+            }
+          }
+          INITGRADLE
+
+      - name: Compilar (APK release)
         shell: bash
         env:
           CCACHE_DIR: ${{ github.workspace }}/.ccache
           CMAKE_C_COMPILER_LAUNCHER: ccache
           CMAKE_CXX_COMPILER_LAUNCHER: ccache
           CMAKE_GENERATOR: Ninja
-          TASK: ${{ github.event.inputs.gradle_task || 'assembleRelease' }}
         run: |
           set -o pipefail
-          cd "fractal/${{ steps.proj.outputs.dir }}"
+          cd "cemu/${{ steps.proj.outputs.dir }}"
           chmod +x ./gradlew
-          ./gradlew "$TASK" -Pandroid.injected.build.abi=arm64-v8a \
+          ./gradlew assembleRelease -I "$HOME/opt-init.gradle" -Pandroid.injected.build.abi=arm64-v8a \
             --no-daemon --stacktrace --console=plain 2>&1 | tee "$GITHUB_WORKSPACE/logs/build.log"
 
       - name: Resumo do erro
@@ -155,17 +177,25 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
 
-      - name: Coletar APK
+      - name: Assinar o APK com chave de teste
         shell: bash
         run: |
           set -eo pipefail
           mkdir -p out
-          find fractal -name "*.apk" -path "*outputs*" -exec cp -v {} out/ \;
+          APK=$(find cemu -name "*.apk" -path "*release*" -not -name "*aligned*" | head -1)
+          [ -n "$APK" ] || { echo "APK release não encontrado"; find cemu -name "*.apk"; exit 1; }
+          BT=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)
+          keytool -genkeypair -keystore test.jks -storepass android -keypass android -alias key \
+            -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=WiiXNative Test"
+          "$BT/zipalign" -f -p 4 "$APK" aligned.apk
+          "$BT/apksigner" sign --ks test.jks --ks-pass pass:android --key-pass pass:android \
+            --out out/WiiXNative-cemu-otimizado.apk aligned.apk
+          "$BT/apksigner" verify out/WiiXNative-cemu-otimizado.apk
           ls -la out
 
       - uses: actions/upload-artifact@v4
         with:
-          name: WiiXNative-Fractal-apk
+          name: WiiXNative-cemu-otimizado-apk
           path: out/*.apk
           if-no-files-found: error
           retention-days: 14
