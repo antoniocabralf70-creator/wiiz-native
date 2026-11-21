@@ -1,0 +1,179 @@
+name: WiiXNative Build (só o núcleo do Fractal)
+
+# Compila o Fractal (https://github.com/dfdx047/Fractal), emulador de Wii U para Android
+# derivado do Cemu. Licença MPL-2.0 (geração de quadros em GPL-3.0): mantenha os créditos
+# e a licença ao redistribuir o APK.
+
+on:
+  workflow_dispatch:
+    inputs:
+      fractal_ref:
+        description: "Branch, tag ou commit do Fractal"
+        type: string
+        default: main
+      gradle_task:
+        description: "Tarefa do Gradle (padrão: só o núcleo nativo, sem APK)"
+        type: choice
+        default: externalNativeBuildRelease
+        options:
+          - externalNativeBuildRelease
+          - externalNativeBuildDebug
+          - assembleRelease
+          - assembleDebug
+      inject_flags:
+        description: "Injetar flags -O3/LTO próprias (o Fractal já vem ajustado; deixe desligado)"
+        type: boolean
+        default: false
+      cpu_profile:
+        description: "Perfil de CPU, só se inject_flags estiver ligado"
+        type: choice
+        default: armv82
+        options:
+          - armv82
+          - armv8
+  push:
+    branches: [main, master]
+
+concurrency:
+  group: wiixnative-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  FRACTAL_REPO: "https://github.com/dfdx047/Fractal.git"
+
+jobs:
+  build-fractal:
+    name: Compilar Fractal (arm64-v8a)
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+
+    steps:
+      - name: Liberar espaço em disco
+        shell: bash
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost /opt/hostedtoolcache/CodeQL || true
+          df -h /
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Ferramentas de build
+        shell: bash
+        run: |
+          set -eo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ninja-build ccache pkg-config zip unzip curl git
+          { yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses >/dev/null; } || true
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ${{ github.workspace }}/.ccache
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+            ~/.cache/vcpkg
+          key: fractal-${{ runner.os }}-${{ github.run_id }}
+          restore-keys: fractal-${{ runner.os }}-
+
+      - name: Baixar o Fractal (com submódulos)
+        shell: bash
+        run: |
+          set -eo pipefail
+          mkdir -p logs
+          git clone "$FRACTAL_REPO" fractal
+          cd fractal
+          git checkout "${{ github.event.inputs.fractal_ref || 'main' }}"
+          git submodule update --init --recursive --depth 1 || git submodule update --init --recursive
+          echo "commit: $(git rev-parse HEAD)"
+
+      - name: Localizar o projeto Gradle
+        id: proj
+        shell: bash
+        run: |
+          set -eo pipefail
+          cd fractal
+          echo "=== BUILD / docs ==="
+          ls -la; ls BUILD* docs 2>/dev/null | head -30 || true
+          GW=$(find . -maxdepth 4 -name gradlew -not -path "*/dependencies/*" -not -path "*/externals/*" | head -1)
+          if [ -z "$GW" ]; then echo "gradlew não encontrado"; find . -maxdepth 3 -name "build.gradle*" | head; exit 1; fi
+          DIR=$(dirname "$GW")
+          echo "Projeto Gradle em: $DIR"
+          echo "dir=$DIR" >> "$GITHUB_OUTPUT"
+
+      - name: Flags opcionais (-O3, LTO, perfil MediaTek)
+        if: ${{ github.event.inputs.inject_flags == 'true' }}
+        shell: bash
+        run: |
+          set -eo pipefail
+          if [ "${{ github.event.inputs.cpu_profile }}" = "armv8" ]; then
+            ARCH="-march=armv8-a+crc+crypto -mtune=cortex-a55"
+          else
+            ARCH="-march=armv8.2-a+dotprod+fp16+crypto -mtune=cortex-a76"
+          fi
+          C="-O3 $ARCH -DNDEBUG -fomit-frame-pointer -fvisibility=hidden -ffunction-sections -fdata-sections -flto=thin"
+          L="-flto=thin -Wl,--gc-sections -Wl,-O2 -Wl,--icf=all"
+          echo "CFLAGS=$C" >> "$GITHUB_ENV"; echo "CXXFLAGS=$C" >> "$GITHUB_ENV"; echo "LDFLAGS=$L" >> "$GITHUB_ENV"
+          echo "Flags: $C"
+
+      - name: Compilar
+        shell: bash
+        env:
+          CCACHE_DIR: ${{ github.workspace }}/.ccache
+          CMAKE_C_COMPILER_LAUNCHER: ccache
+          CMAKE_CXX_COMPILER_LAUNCHER: ccache
+          CMAKE_GENERATOR: Ninja
+          TASK: ${{ github.event.inputs.gradle_task || 'externalNativeBuildRelease' }}
+        run: |
+          set -o pipefail
+          cd "fractal/${{ steps.proj.outputs.dir }}"
+          chmod +x ./gradlew
+          ./gradlew "$TASK" -Pandroid.injected.build.abi=arm64-v8a \
+            --no-daemon --stacktrace --console=plain 2>&1 | tee "$GITHUB_WORKSPACE/logs/build.log"
+
+      - name: Resumo do erro
+        if: failure()
+        shell: bash
+        run: |
+          {
+            echo "### Erros do build"
+            echo '```'
+            grep -nE "error:|FAILED|What went wrong|Exception|undefined reference|vcpkg" logs/build.log | head -40 || true
+            echo '---'
+            tail -n 40 logs/build.log || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Enviar logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: WiiXNative-logs
+          path: logs/
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Coletar o núcleo (.so) e o APK, se houver
+        shell: bash
+        env:
+          TASK: ${{ github.event.inputs.gradle_task || 'externalNativeBuildRelease' }}
+        run: |
+          set -eo pipefail
+          mkdir -p out/core
+          # bibliotecas nativas arm64 geradas pelo CMake (núcleo)
+          find fractal \( -path "*/.cxx/*" -o -path "*/intermediates/cxx/*" -o -path "*/intermediates/cmake/*" -o -path "*/merged_native_libs/*" -o -path "*/stripped_native_libs/*" \) \
+               -path "*arm64-v8a*" -name "*.so" -exec cp -v --backup=numbered {} out/core/ \; || true
+          case "$TASK" in assemble*) find fractal -name "*.apk" -path "*outputs*" -exec cp -v {} out/ \; ;; esac
+          echo "=== Conteúdo ==="; ls -la out out/core
+          [ -n "$(ls -A out/core)" ] || { echo "Nenhuma .so arm64-v8a encontrada"; exit 1; }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: WiiXNative-nucleo-arm64
+          path: out/
+          if-no-files-found: error
+          retention-days: 14
