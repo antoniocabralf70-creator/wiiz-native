@@ -1,0 +1,739 @@
+name: Build APK
+on:
+  push:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - name: Preparar Android SDK (ja vem na maquina)
+        run: |
+          echo "ANDROID_HOME=$ANDROID_HOME"
+          yes | sdkmanager --licenses > /dev/null || true
+          sdkmanager --install "ndk;26.1.10909125" "cmake;3.22.1" || true
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.7
+      - name: Gerar projeto 64exem
+        run: |
+          set -e
+          cat > settings.gradle.kts <<'N64EMU_EOF'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositories { google(); mavenCentral() } }
+          rootProject.name = "N64Emu"
+          include(":app")
+          N64EMU_EOF
+          cat > build.gradle.kts <<'N64EMU_EOF'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          N64EMU_EOF
+          cat > gradle.properties <<'N64EMU_EOF'
+          org.gradle.jvmargs=-Xmx2g
+          android.useAndroidX=true
+          N64EMU_EOF
+          mkdir -p app
+          cat > app/build.gradle.kts <<'N64EMU_EOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+          android {
+              namespace = "dev.n64emu.app"
+              compileSdk = 34
+              ndkVersion = "26.1.10909125"
+              defaultConfig {
+                  applicationId = "dev.n64emu.app"
+                  minSdk = 26
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "0.2.0"
+                  ndk { abiFilters += listOf("arm64-v8a") }
+                  externalNativeBuild { cmake { cppFlags += "-std=c++17" } }
+              }
+              externalNativeBuild { cmake { path = file("src/main/cpp/CMakeLists.txt"); version = "3.22.1" } }
+              packaging { jniLibs { useLegacyPackaging = true } }
+              buildTypes { release { isMinifyEnabled = false } }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+          }
+          dependencies {
+              implementation("androidx.core:core-ktx:1.13.1")
+              implementation("androidx.appcompat:appcompat:1.7.0")
+          }
+          N64EMU_EOF
+          mkdir -p app/src/main
+          cat > app/src/main/AndroidManifest.xml <<'N64EMU_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-feature android:glEsVersion="0x00030000" android:required="true" />
+              <application
+                  android:label="64exem"
+                  android:theme="@style/Theme.AppCompat.DayNight.NoActionBar">
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+                  <activity android:name=".EmulatorActivity"
+                      android:screenOrientation="landscape"
+                      android:configChanges="orientation|screenSize|keyboardHidden" />
+              </application>
+          </manifest>
+          N64EMU_EOF
+          mkdir -p app/src/main/res/values
+          cat > app/src/main/res/values/strings.xml <<'N64EMU_EOF'
+          <resources><string name="app_name">64exem</string></resources>
+          N64EMU_EOF
+          mkdir -p app/src/main/java/dev/n64emu/app
+          cat > app/src/main/java/dev/n64emu/app/MainActivity.kt <<'N64EMU_EOF'
+          package dev.n64emu.app
+
+          import android.content.Intent
+          import android.net.Uri
+          import android.os.Bundle
+          import android.view.Gravity
+          import android.widget.*
+          import androidx.activity.result.contract.ActivityResultContracts
+          import androidx.appcompat.app.AppCompatActivity
+
+          class MainActivity : AppCompatActivity() {
+              private lateinit var settings: Settings
+              private lateinit var resLabel: TextView
+
+              private val pickRom = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri: Uri? ->
+                  uri ?: return@registerForActivityResult
+                  contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                  startActivity(Intent(this, EmulatorActivity::class.java).setData(uri))
+              }
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  settings = Settings(this)
+
+                  val root = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      gravity = Gravity.CENTER
+                      setPadding(48, 48, 48, 48)
+                  }
+                  val title = TextView(this).apply { text = "64exem"; textSize = 28f }
+                  val open = Button(this).apply {
+                      text = "Abrir ROM"
+                      setOnClickListener { pickRom.launch(arrayOf("*/*")) }
+                  }
+                  resLabel = TextView(this).apply { text = "Resolução: ${settings.resolutionFactor}x" }
+                  val seek = SeekBar(this).apply {
+                      max = 9
+                      progress = settings.resolutionFactor - 1
+                      setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                          override fun onProgressChanged(s: SeekBar?, v: Int, fromUser: Boolean) {
+                              settings.resolutionFactor = v + 1
+                              resLabel.text = "Resolução: ${v + 1}x"
+                          }
+                          override fun onStartTrackingTouch(s: SeekBar?) {}
+                          override fun onStopTrackingTouch(s: SeekBar?) {}
+                      })
+                  }
+                  val tex = CheckBox(this).apply {
+                      text = "Texturas HD / mods"
+                      isChecked = settings.texturePacks
+                      setOnCheckedChangeListener { _, c -> settings.texturePacks = c }
+                  }
+                  listOf(title, open, resLabel, seek, tex).forEach { root.addView(it) }
+                  setContentView(root)
+              }
+          }
+          N64EMU_EOF
+          mkdir -p app/src/main/java/dev/n64emu/app
+          cat > app/src/main/java/dev/n64emu/app/EmulatorActivity.kt <<'N64EMU_EOF'
+          package dev.n64emu.app
+
+          import android.os.Bundle
+          import android.view.SurfaceHolder
+          import android.view.SurfaceView
+          import android.widget.FrameLayout
+          import androidx.appcompat.app.AppCompatActivity
+          import androidx.core.view.WindowCompat
+          import androidx.core.view.WindowInsetsCompat
+          import androidx.core.view.WindowInsetsControllerCompat
+          import java.io.File
+          import java.io.FileOutputStream
+
+          class EmulatorActivity : AppCompatActivity(), SurfaceHolder.Callback {
+              private var started = false
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  WindowCompat.setDecorFitsSystemWindows(window, false)
+                  WindowInsetsControllerCompat(window, window.decorView).apply {
+                      hide(WindowInsetsCompat.Type.systemBars())
+                      systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+                  }
+                  val root = FrameLayout(this)
+                  val sv = SurfaceView(this)
+                  sv.holder.addCallback(this)
+                  root.addView(sv)
+                  root.addView(ControlsView(this))
+                  setContentView(root)
+              }
+
+              override fun surfaceCreated(h: SurfaceHolder) {
+                  if (started) return
+                  started = true
+                  val uri = intent.data ?: return
+                  val surface = h.surface
+                  Thread {
+                      val s = Settings(this)
+                      val rom = File(cacheDir, "rom.z64")
+                      contentResolver.openInputStream(uri)?.use { it.copyTo(FileOutputStream(rom)) }
+
+                      val sys = File(getExternalFilesDir(null), "system").apply { mkdirs() }
+                      File(sys, "Mupen64plus/hires_texture").mkdirs()
+                      File(sys, "hires_texture").mkdirs()
+                      val saves = File(getExternalFilesDir(null), "saves").apply { mkdirs() }
+
+                      NativeBridge.init(applicationInfo.nativeLibraryDir + "/libmupen_core.so", sys.absolutePath, saves.absolutePath)
+                      NativeBridge.setOption("mupen64plus-rdp-plugin", "gliden64")
+                      NativeBridge.setOption("mupen64plus-rsp-plugin", "hle")
+                      NativeBridge.setOption("mupen64plus-43screensize", "320x240")
+                      NativeBridge.setOption("mupen64plus-EnableNativeResFactor", s.resolutionFactor.toString())
+                      NativeBridge.setOption("mupen64plus-txHiresEnable", if (s.texturePacks) "True" else "False")
+                      NativeBridge.start(rom.absolutePath, surface)
+                  }.start()
+              }
+
+              override fun surfaceChanged(h: SurfaceHolder, f: Int, w: Int, hh: Int) {}
+              override fun surfaceDestroyed(h: SurfaceHolder) { NativeBridge.stop(); started = false }
+              override fun onPause() { super.onPause(); NativeBridge.pause() }
+              override fun onResume() { super.onResume(); NativeBridge.resume() }
+          }
+          N64EMU_EOF
+          mkdir -p app/src/main/java/dev/n64emu/app
+          cat > app/src/main/java/dev/n64emu/app/ControlsView.kt <<'N64EMU_EOF'
+          package dev.n64emu.app
+
+          import android.content.Context
+          import android.graphics.Canvas
+          import android.graphics.Color
+          import android.graphics.Paint
+          import android.view.MotionEvent
+          import android.view.View
+          import kotlin.math.hypot
+
+          /** Controles na tela. IDs 0..15 = botões RetroPad; 100..103 = botões C. */
+          class ControlsView(ctx: Context) : View(ctx) {
+              private class Btn(val id: Int, val label: String, val cx: Float, val cy: Float, val r: Float)
+
+              private val paint = Paint(Paint.ANTI_ALIAS_FLAG)
+              private var btns = listOf<Btn>()
+              private val pressed = BooleanArray(16)
+              private var stickCx = 0f; private var stickCy = 0f; private var stickR = 0f
+              private var sx = 0f; private var sy = 0f
+              private var cx = 0f; private var cy = 0f
+
+              override fun onSizeChanged(w: Int, h: Int, ow: Int, oh: Int) {
+                  val u = h.toFloat()
+                  val W = w.toFloat()
+                  stickCx = 0.17f * W; stickCy = 0.70f * u; stickR = 0.17f * u
+                  val d = 0.11f * u; val dr = 0.055f * u
+                  val dx = 0.10f * W; val dy = 0.30f * u
+                  val ccx = 0.80f * W; val ccy = 0.32f * u; val cr = 0.055f * u; val co = 0.11f * u
+                  btns = listOf(
+                      Btn(4, "▲", dx, dy - d, dr), Btn(5, "▼", dx, dy + d, dr),
+                      Btn(6, "◀", dx - d, dy, dr), Btn(7, "▶", dx + d, dy, dr),
+                      Btn(0, "A", 0.90f * W, 0.68f * u, 0.085f * u),
+                      Btn(1, "B", 0.79f * W, 0.78f * u, 0.075f * u),
+                      Btn(3, "ST", 0.50f * W, 0.90f * u, 0.06f * u),
+                      Btn(10, "L", 0.06f * W, 0.08f * u, 0.07f * u),
+                      Btn(12, "Z", 0.15f * W, 0.08f * u, 0.07f * u),
+                      Btn(11, "R", 0.94f * W, 0.08f * u, 0.07f * u),
+                      Btn(100, "C▲", ccx, ccy - co, cr), Btn(101, "C▼", ccx, ccy + co, cr),
+                      Btn(102, "C◀", ccx - co, ccy, cr), Btn(103, "C▶", ccx + co, ccy, cr),
+                  )
+              }
+
+              override fun onDraw(c: Canvas) {
+                  paint.style = Paint.Style.FILL
+                  paint.color = Color.argb(60, 255, 255, 255)
+                  c.drawCircle(stickCx, stickCy, stickR, paint)
+                  paint.color = Color.argb(140, 255, 255, 255)
+                  c.drawCircle(stickCx + sx * stickR, stickCy + sy * stickR, stickR * 0.4f, paint)
+                  for (b in btns) {
+                      val on = if (b.id < 16) pressed[b.id] else isCOn(b.id)
+                      paint.color = Color.argb(if (on) 170 else 80, 255, 255, 255)
+                      c.drawCircle(b.cx, b.cy, b.r, paint)
+                      paint.color = Color.argb(220, 0, 0, 0)
+                      paint.textSize = b.r * 0.8f
+                      paint.textAlign = Paint.Align.CENTER
+                      c.drawText(b.label, b.cx, b.cy + b.r * 0.28f, paint)
+                  }
+              }
+
+              private fun isCOn(id: Int) = when (id) {
+                  100 -> cy < -0.5f; 101 -> cy > 0.5f; 102 -> cx < -0.5f; else -> cx > 0.5f
+              }
+
+              override fun onTouchEvent(e: MotionEvent): Boolean {
+                  val np = BooleanArray(16)
+                  var nsx = 0f; var nsy = 0f; var ncx = 0f; var ncy = 0f
+                  val act = e.actionMasked
+                  if (act != MotionEvent.ACTION_UP && act != MotionEvent.ACTION_CANCEL) {
+                      for (i in 0 until e.pointerCount) {
+                          if (act == MotionEvent.ACTION_POINTER_UP && i == e.actionIndex) continue
+                          val x = e.getX(i); val y = e.getY(i)
+                          if (hypot(x - stickCx, y - stickCy) < stickR * 1.6f) {
+                              var dx = (x - stickCx) / stickR; var dy = (y - stickCy) / stickR
+                              val len = hypot(dx, dy)
+                              if (len > 1f) { dx /= len; dy /= len }
+                              nsx = dx; nsy = dy
+                              continue
+                          }
+                          for (b in btns) {
+                              if (hypot(x - b.cx, y - b.cy) < b.r * 1.3f) {
+                                  when (b.id) {
+                                      100 -> ncy = -1f; 101 -> ncy = 1f
+                                      102 -> ncx = -1f; 103 -> ncx = 1f
+                                      else -> np[b.id] = true
+                                  }
+                              }
+                          }
+                      }
+                  }
+                  for (i in 0..15) if (np[i] != pressed[i]) { pressed[i] = np[i]; NativeBridge.setButton(i, np[i]) }
+                  if (nsx != sx || nsy != sy) { sx = nsx; sy = nsy; NativeBridge.setAnalog(0, sx, sy) }
+                  if (ncx != cx || ncy != cy) { cx = ncx; cy = ncy; NativeBridge.setAnalog(1, cx, cy) }
+                  invalidate()
+                  return true
+              }
+          }
+          N64EMU_EOF
+          mkdir -p app/src/main/java/dev/n64emu/app
+          cat > app/src/main/java/dev/n64emu/app/NativeBridge.kt <<'N64EMU_EOF'
+          package dev.n64emu.app
+
+          import android.view.Surface
+
+          /** Ponte JNI para o host libretro (núcleo mupen64plus_next + GLideN64). */
+          object NativeBridge {
+              init { System.loadLibrary("n64emu") }
+
+              external fun init(libPath: String, systemDir: String, saveDir: String)
+              external fun setOption(key: String, value: String)
+              external fun start(romPath: String, surface: Surface)
+              external fun pause()
+              external fun resume()
+              external fun stop()
+              external fun setButton(id: Int, pressed: Boolean)
+              external fun setAnalog(which: Int, x: Float, y: Float) // 0 = analógico, 1 = botões C
+          }
+          N64EMU_EOF
+          mkdir -p app/src/main/java/dev/n64emu/app
+          cat > app/src/main/java/dev/n64emu/app/Settings.kt <<'N64EMU_EOF'
+          package dev.n64emu.app
+
+          import android.content.Context
+
+          class Settings(ctx: Context) {
+              private val p = ctx.getSharedPreferences("n64emu", Context.MODE_PRIVATE)
+              var resolutionFactor: Int
+                  get() = p.getInt("res", 2)
+                  set(v) = p.edit().putInt("res", v.coerceIn(1, 10)).apply()
+              var texturePacks: Boolean
+                  get() = p.getBoolean("tex", true)
+                  set(v) = p.edit().putBoolean("tex", v).apply()
+              var romFolder: String?
+                  get() = p.getString("rom_folder", null)
+                  set(v) = p.edit().putString("rom_folder", v).apply()
+          }
+          N64EMU_EOF
+          mkdir -p app/src/main/cpp
+          cat > app/src/main/cpp/CMakeLists.txt <<'N64EMU_EOF'
+          cmake_minimum_required(VERSION 3.22)
+          project(n64emu)
+
+          # libretro.h é baixado pelo CI para app/src/main/cpp/include
+          add_library(n64emu SHARED native-lib.cpp)
+          target_include_directories(n64emu PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+          target_link_libraries(n64emu android log EGL GLESv3 aaudio dl)
+          N64EMU_EOF
+          mkdir -p app/src/main/cpp
+          cat > app/src/main/cpp/native-lib.cpp <<'N64EMU_EOF'
+          // Host libretro mínimo: carrega o núcleo mupen64plus_next (GLideN64) e roda a ROM.
+          #include <jni.h>
+          #include <android/log.h>
+          #include <android/native_window_jni.h>
+          #include <aaudio/AAudio.h>
+          #include <EGL/egl.h>
+          #include <GLES3/gl3.h>
+          #include <dlfcn.h>
+          #include <atomic>
+          #include <condition_variable>
+          #include <cstdarg>
+          #include <cstdio>
+          #include <map>
+          #include <mutex>
+          #include <string>
+          #include <thread>
+          #include <vector>
+          #include "libretro.h"
+
+          #define TAG "N64Emu"
+          #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, TAG, __VA_ARGS__)
+          #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
+
+          namespace {
+
+          void* g_lib = nullptr;
+          void (*p_set_environment)(retro_environment_t);
+          void (*p_set_video_refresh)(retro_video_refresh_t);
+          void (*p_set_audio_sample)(retro_audio_sample_t);
+          void (*p_set_audio_batch)(retro_audio_sample_batch_t);
+          void (*p_set_input_poll)(retro_input_poll_t);
+          void (*p_set_input_state)(retro_input_state_t);
+          void (*p_init)(void);
+          void (*p_deinit)(void);
+          void (*p_get_system_info)(struct retro_system_info*);
+          void (*p_get_av_info)(struct retro_system_av_info*);
+          bool (*p_load_game)(const struct retro_game_info*);
+          void (*p_unload_game)(void);
+          void (*p_run)(void);
+
+          std::string g_libPath, g_systemDir, g_saveDir;
+          std::map<std::string, std::string> g_options;
+          std::mutex g_optMutex;
+          std::atomic<bool> g_optionsDirty{true};
+
+          std::atomic<bool> g_running{false};
+          std::atomic<bool> g_paused{false};
+          std::thread g_thread;
+          std::mutex g_pauseMutex;
+          std::condition_variable g_pauseCv;
+          ANativeWindow* g_window = nullptr;
+
+          EGLDisplay g_dpy = EGL_NO_DISPLAY;
+          EGLSurface g_surf = EGL_NO_SURFACE;
+          EGLContext g_ctx = EGL_NO_CONTEXT;
+          retro_hw_render_callback g_hw{};
+          GLuint g_fbo = 0, g_tex = 0, g_rbo = 0;
+          unsigned g_frameW = 0, g_frameH = 0;
+          float g_aspect = 4.0f / 3.0f;
+
+          AAudioStream* g_audio = nullptr;
+          std::atomic<int> g_buttons{0};
+          std::atomic<int> g_axes[4] = {};
+
+          #define LOAD(var, name)                                   \
+              var = (decltype(var))dlsym(g_lib, name);              \
+              if (!var) { LOGE("simbolo ausente: %s", name); return false; }
+
+          bool loadCore() {
+              g_lib = dlopen(g_libPath.c_str(), RTLD_NOW | RTLD_LOCAL);
+              if (!g_lib) { LOGE("dlopen falhou: %s", dlerror()); return false; }
+              LOAD(p_set_environment, "retro_set_environment");
+              LOAD(p_set_video_refresh, "retro_set_video_refresh");
+              LOAD(p_set_audio_sample, "retro_set_audio_sample");
+              LOAD(p_set_audio_batch, "retro_set_audio_sample_batch");
+              LOAD(p_set_input_poll, "retro_set_input_poll");
+              LOAD(p_set_input_state, "retro_set_input_state");
+              LOAD(p_init, "retro_init");
+              LOAD(p_deinit, "retro_deinit");
+              LOAD(p_get_system_info, "retro_get_system_info");
+              LOAD(p_get_av_info, "retro_get_system_av_info");
+              LOAD(p_load_game, "retro_load_game");
+              LOAD(p_unload_game, "retro_unload_game");
+              LOAD(p_run, "retro_run");
+              return true;
+          }
+
+          // ---------- callbacks ----------
+          void logCb(enum retro_log_level level, const char* fmt, ...) {
+              va_list ap;
+              va_start(ap, fmt);
+              int prio = level == RETRO_LOG_ERROR ? ANDROID_LOG_ERROR
+                       : level == RETRO_LOG_WARN  ? ANDROID_LOG_WARN
+                       : level == RETRO_LOG_INFO  ? ANDROID_LOG_INFO : ANDROID_LOG_DEBUG;
+              __android_log_vprint(prio, "N64Core", fmt, ap);
+              va_end(ap);
+          }
+
+          uintptr_t getCurrentFb() { return (uintptr_t)g_fbo; }
+          retro_proc_address_t getProc(const char* sym) { return (retro_proc_address_t)eglGetProcAddress(sym); }
+
+          bool envCb(unsigned cmd, void* data) {
+              switch (cmd) {
+                  case RETRO_ENVIRONMENT_GET_CAN_DUPE: *(bool*)data = true; return true;
+                  case RETRO_ENVIRONMENT_SET_PIXEL_FORMAT: return true;
+                  case RETRO_ENVIRONMENT_GET_SYSTEM_DIRECTORY: *(const char**)data = g_systemDir.c_str(); return true;
+                  case RETRO_ENVIRONMENT_GET_SAVE_DIRECTORY: *(const char**)data = g_saveDir.c_str(); return true;
+                  case RETRO_ENVIRONMENT_GET_LOG_INTERFACE: ((retro_log_callback*)data)->log = logCb; return true;
+                  case RETRO_ENVIRONMENT_GET_VARIABLE: {
+                      auto* v = (retro_variable*)data;
+                      std::lock_guard<std::mutex> l(g_optMutex);
+                      auto it = g_options.find(v->key);
+                      if (it == g_options.end()) return false;
+                      v->value = it->second.c_str();
+                      return true;
+                  }
+                  case RETRO_ENVIRONMENT_GET_VARIABLE_UPDATE:
+                      *(bool*)data = g_optionsDirty.exchange(false);
+                      return true;
+                  case RETRO_ENVIRONMENT_SET_VARIABLES: return true;
+                  case RETRO_ENVIRONMENT_SET_SERIALIZATION_QUIRKS: return true;
+                  case RETRO_ENVIRONMENT_SET_HW_RENDER: {
+                      auto* hw = (retro_hw_render_callback*)data;
+                      hw->get_current_framebuffer = getCurrentFb;
+                      hw->get_proc_address = getProc;
+                      g_hw = *hw;
+                      LOGI("HW render pedido: tipo=%u v%u.%u", hw->context_type, hw->version_major, hw->version_minor);
+                      return true;
+                  }
+                  default: return false;
+              }
+          }
+
+          void present() {
+              EGLint sw = 0, sh = 0;
+              eglQuerySurface(g_dpy, g_surf, EGL_WIDTH, &sw);
+              eglQuerySurface(g_dpy, g_surf, EGL_HEIGHT, &sh);
+              GLboolean scissor = glIsEnabled(GL_SCISSOR_TEST);
+              glDisable(GL_SCISSOR_TEST);
+              glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
+              glViewport(0, 0, sw, sh);
+              glClearColor(0, 0, 0, 1);
+              glClear(GL_COLOR_BUFFER_BIT);
+              int dw = sw, dh = (int)(sw / g_aspect);
+              if (dh > sh) { dh = sh; dw = (int)(sh * g_aspect); }
+              int dx = (sw - dw) / 2, dy = (sh - dh) / 2;
+              glBindFramebuffer(GL_READ_FRAMEBUFFER, g_fbo);
+              glBlitFramebuffer(0, 0, g_frameW, g_frameH, dx, dy, dx + dw, dy + dh, GL_COLOR_BUFFER_BIT, GL_LINEAR);
+              glBindFramebuffer(GL_FRAMEBUFFER, g_fbo);
+              if (scissor) glEnable(GL_SCISSOR_TEST);
+              eglSwapBuffers(g_dpy, g_surf);
+          }
+
+          void videoCb(const void* data, unsigned w, unsigned h, size_t) {
+              if (!data) return;
+              g_frameW = w; g_frameH = h;
+              present();
+          }
+
+          void audioOpen(int rate) {
+              AAudioStreamBuilder* b = nullptr;
+              if (AAudio_createStreamBuilder(&b) != AAUDIO_OK) return;
+              AAudioStreamBuilder_setDirection(b, AAUDIO_DIRECTION_OUTPUT);
+              AAudioStreamBuilder_setFormat(b, AAUDIO_FORMAT_PCM_I16);
+              AAudioStreamBuilder_setChannelCount(b, 2);
+              AAudioStreamBuilder_setSampleRate(b, rate);
+              AAudioStreamBuilder_setPerformanceMode(b, AAUDIO_PERFORMANCE_MODE_LOW_LATENCY);
+              if (AAudioStreamBuilder_openStream(b, &g_audio) == AAUDIO_OK) AAudioStream_requestStart(g_audio);
+              else g_audio = nullptr;
+              AAudioStreamBuilder_delete(b);
+          }
+          void audioClose() {
+              if (g_audio) { AAudioStream_requestStop(g_audio); AAudioStream_close(g_audio); g_audio = nullptr; }
+          }
+          size_t audioBatchCb(const int16_t* d, size_t frames) {
+              if (g_audio) AAudioStream_write(g_audio, d, (int32_t)frames, 50LL * 1000000LL);
+              return frames;
+          }
+          void audioSampleCb(int16_t l, int16_t r) { int16_t s[2] = {l, r}; audioBatchCb(s, 1); }
+
+          void pollCb() {}
+          int16_t stateCb(unsigned port, unsigned device, unsigned index, unsigned id) {
+              if (port != 0) return 0;
+              if (device == RETRO_DEVICE_JOYPAD) {
+                  int b = g_buttons.load();
+                  if (id == RETRO_DEVICE_ID_JOYPAD_MASK) return (int16_t)b;
+                  return (int16_t)((b >> id) & 1);
+              }
+              if (device == RETRO_DEVICE_ANALOG) {
+                  int base = (index == RETRO_DEVICE_INDEX_ANALOG_RIGHT) ? 2 : 0;
+                  if (id == RETRO_DEVICE_ID_ANALOG_X) return (int16_t)g_axes[base].load();
+                  if (id == RETRO_DEVICE_ID_ANALOG_Y) return (int16_t)g_axes[base + 1].load();
+              }
+              return 0;
+          }
+
+          // ---------- EGL / FBO ----------
+          bool eglInit() {
+              g_dpy = eglGetDisplay(EGL_DEFAULT_DISPLAY);
+              if (!eglInitialize(g_dpy, nullptr, nullptr)) return false;
+              const EGLint cfgAttr[] = {EGL_RENDERABLE_TYPE, 0x0040 /*ES3*/, EGL_SURFACE_TYPE, EGL_WINDOW_BIT,
+                                        EGL_RED_SIZE, 8, EGL_GREEN_SIZE, 8, EGL_BLUE_SIZE, 8, EGL_ALPHA_SIZE, 8, EGL_NONE};
+              EGLConfig cfg; EGLint n = 0;
+              if (!eglChooseConfig(g_dpy, cfgAttr, &cfg, 1, &n) || n < 1) return false;
+              g_surf = eglCreateWindowSurface(g_dpy, cfg, g_window, nullptr);
+              const EGLint ctxAttr[] = {EGL_CONTEXT_CLIENT_VERSION, 3, EGL_NONE};
+              g_ctx = eglCreateContext(g_dpy, cfg, EGL_NO_CONTEXT, ctxAttr);
+              if (g_surf == EGL_NO_SURFACE || g_ctx == EGL_NO_CONTEXT) return false;
+              return eglMakeCurrent(g_dpy, g_surf, g_surf, g_ctx);
+          }
+          void eglShutdown() {
+              if (g_dpy != EGL_NO_DISPLAY) {
+                  eglMakeCurrent(g_dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+                  if (g_ctx != EGL_NO_CONTEXT) eglDestroyContext(g_dpy, g_ctx);
+                  if (g_surf != EGL_NO_SURFACE) eglDestroySurface(g_dpy, g_surf);
+                  eglTerminate(g_dpy);
+              }
+              g_dpy = EGL_NO_DISPLAY; g_surf = EGL_NO_SURFACE; g_ctx = EGL_NO_CONTEXT;
+          }
+          void createFbo(unsigned w, unsigned h) {
+              glGenFramebuffers(1, &g_fbo);
+              glGenTextures(1, &g_tex);
+              glGenRenderbuffers(1, &g_rbo);
+              glBindTexture(GL_TEXTURE_2D, g_tex);
+              glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+              glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+              glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+              glBindRenderbuffer(GL_RENDERBUFFER, g_rbo);
+              glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH24_STENCIL8, w, h);
+              glBindFramebuffer(GL_FRAMEBUFFER, g_fbo);
+              glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, g_tex, 0);
+              glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_RENDERBUFFER, g_rbo);
+              LOGI("FBO %ux%u status=0x%x", w, h, glCheckFramebufferStatus(GL_FRAMEBUFFER));
+          }
+
+          // ---------- thread do emulador ----------
+          void emuThread(std::string romPath) {
+              bool coreLoaded = false, gameLoaded = false;
+              if (!eglInit()) { LOGE("EGL falhou"); goto done; }
+              eglSwapInterval(g_dpy, 0);
+              if (!loadCore()) goto done;
+              coreLoaded = true;
+
+              p_set_environment(envCb);
+              p_set_video_refresh(videoCb);
+              p_set_audio_sample(audioSampleCb);
+              p_set_audio_batch(audioBatchCb);
+              p_set_input_poll(pollCb);
+              p_set_input_state(stateCb);
+              p_init();
+
+              {
+                  retro_system_info si{};
+                  p_get_system_info(&si);
+                  retro_game_info gi{};
+                  std::vector<uint8_t> buf;
+                  gi.path = romPath.c_str();
+                  if (!si.need_fullpath) {
+                      FILE* f = fopen(romPath.c_str(), "rb");
+                      if (!f) { LOGE("ROM nao abriu"); goto done; }
+                      fseek(f, 0, SEEK_END); long sz = ftell(f); fseek(f, 0, SEEK_SET);
+                      buf.resize(sz);
+                      fread(buf.data(), 1, sz, f);
+                      fclose(f);
+                      gi.data = buf.data(); gi.size = buf.size();
+                  }
+                  if (!p_load_game(&gi)) { LOGE("load_game falhou"); goto done; }
+                  gameLoaded = true;
+
+                  retro_system_av_info av{};
+                  p_get_av_info(&av);
+                  g_aspect = av.geometry.aspect_ratio > 0 ? av.geometry.aspect_ratio
+                           : (av.geometry.base_height ? (float)av.geometry.base_width / av.geometry.base_height : 4.f / 3.f);
+                  unsigned mw = av.geometry.max_width > 640 ? av.geometry.max_width : 640;
+                  unsigned mh = av.geometry.max_height > 480 ? av.geometry.max_height : 480;
+                  createFbo(mw, mh);
+                  audioOpen((int)(av.timing.sample_rate > 0 ? av.timing.sample_rate : 44100));
+                  if (g_hw.context_reset) g_hw.context_reset();
+                  LOGI("rodando");
+              }
+
+              while (g_running) {
+                  if (g_paused) {
+                      std::unique_lock<std::mutex> l(g_pauseMutex);
+                      g_pauseCv.wait(l, [] { return !g_paused || !g_running; });
+                      continue;
+                  }
+                  p_run();
+              }
+
+          done:
+              if (gameLoaded) {
+                  if (g_hw.context_destroy) g_hw.context_destroy();
+                  p_unload_game();
+              }
+              if (coreLoaded) { p_deinit(); dlclose(g_lib); g_lib = nullptr; }
+              audioClose();
+              eglShutdown();
+              g_running = false;
+          }
+
+          std::string jstr(JNIEnv* env, jstring s) {
+              const char* c = env->GetStringUTFChars(s, nullptr);
+              std::string r = c;
+              env->ReleaseStringUTFChars(s, c);
+              return r;
+          }
+
+          }  // namespace
+
+          extern "C" {
+
+          JNIEXPORT void JNICALL Java_dev_n64emu_app_NativeBridge_init(JNIEnv* env, jobject, jstring libPath, jstring sysDir, jstring saveDir) {
+              g_libPath = jstr(env, libPath);
+              g_systemDir = jstr(env, sysDir);
+              g_saveDir = jstr(env, saveDir);
+          }
+          JNIEXPORT void JNICALL Java_dev_n64emu_app_NativeBridge_setOption(JNIEnv* env, jobject, jstring k, jstring v) {
+              std::lock_guard<std::mutex> l(g_optMutex);
+              g_options[jstr(env, k)] = jstr(env, v);
+              g_optionsDirty = true;
+          }
+          JNIEXPORT void JNICALL Java_dev_n64emu_app_NativeBridge_start(JNIEnv* env, jobject, jstring rom, jobject surface) {
+              if (g_thread.joinable()) {
+                  g_running = false; g_paused = false; g_pauseCv.notify_all();
+                  g_thread.join();
+                  if (g_window) { ANativeWindow_release(g_window); g_window = nullptr; }
+              }
+              g_window = ANativeWindow_fromSurface(env, surface);
+              g_running = true;
+              g_paused = false;
+              g_thread = std::thread(emuThread, jstr(env, rom));
+          }
+          JNIEXPORT void JNICALL Java_dev_n64emu_app_NativeBridge_pause(JNIEnv*, jobject) { g_paused = true; }
+          JNIEXPORT void JNICALL Java_dev_n64emu_app_NativeBridge_resume(JNIEnv*, jobject) {
+              g_paused = false; g_pauseCv.notify_all();
+          }
+          JNIEXPORT void JNICALL Java_dev_n64emu_app_NativeBridge_stop(JNIEnv*, jobject) {
+              g_running = false; g_paused = false; g_pauseCv.notify_all();
+              if (g_thread.joinable()) g_thread.join();
+              if (g_window) { ANativeWindow_release(g_window); g_window = nullptr; }
+          }
+          JNIEXPORT void JNICALL Java_dev_n64emu_app_NativeBridge_setButton(JNIEnv*, jobject, jint id, jboolean pressed) {
+              if (id < 0 || id > 15) return;
+              int cur = g_buttons.load();
+              g_buttons = pressed ? (cur | (1 << id)) : (cur & ~(1 << id));
+          }
+          JNIEXPORT void JNICALL Java_dev_n64emu_app_NativeBridge_setAnalog(JNIEnv*, jobject, jint which, jfloat x, jfloat y) {
+              int base = which == 1 ? 2 : 0;
+              g_axes[base] = (int)(x * 32767.f);
+              g_axes[base + 1] = (int)(y * 32767.f);
+          }
+
+          }
+          N64EMU_EOF
+      - name: Baixar núcleo N64 (GLideN64) e libretro.h
+        run: |
+          set -e
+          mkdir -p app/src/main/jniLibs/arm64-v8a app/src/main/cpp/include
+          curl -fL -o core.zip https://buildbot.libretro.com/nightly/android/latest/arm64-v8a/mupen64plus_next_gles3_libretro_android.so.zip
+          unzip -o core.zip -d core_tmp
+          cp core_tmp/*.so app/src/main/jniLibs/arm64-v8a/libmupen_core.so
+          curl -fL -o app/src/main/cpp/include/libretro.h https://raw.githubusercontent.com/libretro/libretro-common/master/include/libretro.h
+      - name: Build APK debug
+        run: gradle assembleDebug
+      - uses: actions/upload-artifact@v4
+        with:
+          name: 64exem-debug
+          path: app/build/outputs/apk/debug/*.apk
